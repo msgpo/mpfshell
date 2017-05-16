@@ -40,33 +40,66 @@ class ConWebsock(ConBase, threading.Thread):
         threading.Thread.__init__(self)
 
         self.daemon = True
-
-        self.fifo = deque()
         self.fifo_lock = threading.Lock()
-
-        # websocket.enableTrace(logging.root.getEffectiveLevel() < logging.INFO)
-        self.ws = websocket.WebSocketApp("ws://%s:8266" % ip,
-                                         on_message=self.on_message,
-                                         on_error=self.on_error,
-                                         on_close=self.on_close)
-
+        self.fifo = deque()
+        self.ws = None
+        self.active = True
         self.start()
 
-        self.timeout = 5.0
+        # websocket.enableTrace(logging.root.getEffectiveLevel() < logging.INFO)
+        #websocket.enableTrace(True)
 
-        if b'Password:' in self.read(256, blocking=False):
-            self.ws.send(password + "\r")
-            if not b'WebREPL connected' in self.read(256, blocking=False):
-                raise ConError()
-        else:
+        success = False
+        for t in range(5): # try 5 times
+            print("Allocating new websocket.")
+            self.ws = websocket.WebSocketApp("ws://%s:8266" % ip,
+                                             on_message=self.on_message,
+                                             on_error=self.on_error,
+                                             on_close=self.on_close)
+            self.ws.keep_running = True
+
+            self.timeout = 5.0
+
+            inp1 = self.read(256, blocking=False)
+            if b'Password:' in inp1:
+                self.ws.send(password + "\r")
+                inp2 = self.read(256, blocking=False)
+                if not b'WebREPL connected' in inp2:
+                    pass
+                else:
+                    success = True
+                    break;
+            # reset socket and prepare to reconnect
+            print("Retrying.")
+            oldws = self.ws
+            self.ws = None
+            oldws.keep_running = False
+            try:
+                oldws.close()
+            except:
+                pass
+            self.cleanup()
+
+        if not success:
+            self.close()
             raise ConError()
 
+        # we were successful to connect
         self.timeout = 1.0
 
-        logging.info("websocket connected to ws://%s:8266" % ip)
+        logging.info("websocket connected to ws://{}:8266 after {} tries."
+                     .format(ip,t))
 
     def run(self):
-        self.ws.run_forever()
+        while self.active:
+            if self.ws is not None:
+                print("Entering run loop.")
+                self.ws.run_forever()
+                print("Exiting run loop.")
+            else:
+                print("Waiting.")
+                time.sleep(0.1)  # no busy waiting
+                print("Waited.")
 
     def __del__(self):
         self.close()
@@ -81,29 +114,37 @@ class ConWebsock(ConBase, threading.Thread):
 
     def on_error(self, ws, error):
         logging.error("websocket error: %s" % error)
+        print("websocket error: %s" % error)
 
         try:
+            self.fifo_lock.release()
+        except:
+            pass
+
+    def cleanup(self):
+        try:
+            self.ws.close()
             self.fifo_lock.release()
         except:
             pass
 
     def on_close(self, ws):
         logging.info("websocket closed")
-
-        try:
-            self.fifo_lock.release()
-        except:
-            pass
+        print("on_close called.")
+        self.cleanup()
 
     def close(self):
+        print("Close called: active=False.")
         try:
-            self.ws.close()
-
-            try:
-                self.fifo_lock.release()
-            except:
-                pass
-
+            self.ws.send("\2")  # ctrl b to exit raw-repl
+            time.sleep(0.1)
+            # reset a potentially messed up repl
+            self.ws.send("import webrepl; webrepl.stop(); webrepl.start()\r")
+        except:
+            pass
+        self.active = False
+        try:
+            self.cleanup()
             self.join()
         except Exception:
             try:
